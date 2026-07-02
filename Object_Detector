@@ -1,0 +1,89 @@
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+from cv_bridge import CvBridge
+import cv2
+import time
+import os
+
+
+class ObjectDetector(Node):
+    def __init__(self):
+        super().__init__('object_detector')
+        self.bridge = CvBridge()
+        self.sub = self.create_subscription(Image, '/simple_drone/front/image_raw', self.image_cb, 10)
+        self.annotated_pub = self.create_publisher(Image, '/surveillance/detection_image', 10)
+        self.alert_pub = self.create_publisher(String, '/surveillance/alert', 10)
+
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=200, varThreshold=40, detectShadows=False)
+        self.min_area = 800
+        self.last_alert_time = 0.0
+        self.alert_cooldown = 4.0
+
+        self.snapshot_dir = os.path.expanduser('~/intrusion_snapshots')
+        os.makedirs(self.snapshot_dir, exist_ok=True)
+
+        self.get_logger().info('Object detector started, watching camera feed...')
+
+    def image_cb(self, msg):
+        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+        fg_mask = self.bg_subtractor.apply(frame)
+        fg_mask = cv2.medianBlur(fg_mask, 5)
+        _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+
+        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        intrusion_detected = False
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < self.min_area:
+                continue
+            intrusion_detected = True
+            x, y, w, h = cv2.boundingRect(c)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            cv2.putText(frame, 'UNKNOWN OBJECT', (x, y - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        if intrusion_detected:
+            self.trigger_alert(frame)
+
+        annotated_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+        annotated_msg.header = msg.header
+        self.annotated_pub.publish(annotated_msg)
+
+    def trigger_alert(self, frame):
+        now = time.time()
+        if now - self.last_alert_time < self.alert_cooldown:
+            return
+        self.last_alert_time = now
+
+        timestamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+        alert_text = 'INTRUSION ALERT: movement/unknown object detected at {}'.format(timestamp)
+        self.get_logger().warn(alert_text)
+
+        msg = String()
+        msg.data = alert_text
+        self.alert_pub.publish(msg)
+
+        snapshot_path = os.path.join(self.snapshot_dir, 'intrusion_{}.jpg'.format(timestamp))
+        cv2.imwrite(snapshot_path, frame)
+        self.get_logger().info('Snapshot saved: {}'.format(snapshot_path))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ObjectDetector()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
